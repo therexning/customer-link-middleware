@@ -269,7 +269,18 @@ For production environments consider:
 - Limiting by network
 
 ---
+# Verification (Smoke Test)
+Run:
 
+cmd.exe:
+
+set BASE_URL=https://<your-cloud-run-url>
+set STORE_ID=101
+set TEST_Q=+61499999999
+node scripts\smoke-test.js
+</example>
+
+---
 # Summary
 
 This middleware provides a reusable integration pattern:
