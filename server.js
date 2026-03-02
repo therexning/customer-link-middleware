@@ -1,15 +1,22 @@
 /**
- * RPOS Customer Service Web API v8 middleware (READ-only MVP)
- * Auth: Shopify Dev Dashboard app via OAuth2 client credentials grant
+ * RPOS Customer Service Web API v8 middleware (READ + LIMITED EDIT MVP)
  *
- * Env vars:
- *   SHOPIFY_SHOP=roqqiodev.myshopify.com
- *   SHOPIFY_CLIENT_ID=...
- *   SHOPIFY_CLIENT_SECRET=...
- *   SHOPIFY_API_VERSION=2026-01
+ * Supports:
+ *  - GET  /api/v8/customers/search?q=...
+ *  - GET  /api/v8/customers/{entityId}
+ *  - PUT  /api/v8/customers/{entityId}   (MVP: firstName/lastName/email/phone only)
  *
- * (Optional fallback, not needed if using client creds)
- *   SHOPIFY_TOKEN=shpat_...
+ * Auth to Shopify:
+ *  - Dev Dashboard App via OAuth2 Client Credentials Grant
+ *
+ * Env vars (Cloud Run):
+ *  - SHOPIFY_SHOP=roqqiodev.myshopify.com
+ *  - SHOPIFY_CLIENT_ID (from Secret Manager)
+ *  - SHOPIFY_CLIENT_SECRET (from Secret Manager)
+ *  - SHOPIFY_API_VERSION=2026-01
+ *
+ * Notes:
+ *  - Requests require header: storeId
  */
 
 const http = require("http");
@@ -18,14 +25,10 @@ const { URL } = require("url");
 const SHOP = process.env.SHOPIFY_SHOP;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
-// Dev Dashboard credentials (preferred)
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 
-// Legacy token fallback (optional)
-const LEGACY_TOKEN = process.env.SHOPIFY_TOKEN;
-
-// ----------------- utils -----------------
+// ----------------- helpers -----------------
 function sendJson(res, statusCode, obj) {
   res.writeHead(statusCode, { "Content-Type": "application/json;charset=UTF-8" });
   res.end(JSON.stringify(obj));
@@ -44,8 +47,7 @@ function isoFarFuture() {
 }
 
 function requireStoreId(req) {
-  // Header name in YAML is storeId; Node lowercases headers.
-  const storeId = req.headers["storeid"];
+  const storeId = req.headers["storeid"]; // node lowercases headers
   return storeId ? String(storeId) : "";
 }
 
@@ -61,11 +63,18 @@ function escapeForShopifySearch(q) {
   return String(q || "").replace(/"/g, '\\"').trim();
 }
 
-// ----------------- Shopify access token (client credentials grant) -----------------
-// Shopify docs: POST https://{shop}.myshopify.com/admin/oauth/access_token
-// Body (x-www-form-urlencoded): grant_type=client_credentials, client_id, client_secret
-// Response includes access_token + expires_in (usually 86399 seconds). :contentReference[oaicite:1]{index=1}
+async function readJsonBody(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  if (!body) return null;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return "__INVALID_JSON__";
+  }
+}
 
+// ----------------- Shopify access token (client credentials grant) -----------------
 let cachedAccessToken = null;
 let cachedAccessTokenExpiresAtMs = 0;
 
@@ -74,6 +83,8 @@ function haveClientCreds() {
 }
 
 async function fetchAccessTokenViaClientCredentials() {
+  // Shopify token endpoint for client credentials grant:
+  // POST https://{shop}/admin/oauth/access_token
   const tokenUrl = `https://${SHOP}/admin/oauth/access_token`;
 
   const body = new URLSearchParams();
@@ -83,7 +94,10 @@ async function fetchAccessTokenViaClientCredentials() {
 
   const resp = await fetch(tokenUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
     body,
   });
 
@@ -92,40 +106,28 @@ async function fetchAccessTokenViaClientCredentials() {
     const msg = json?.error_description || json?.error || JSON.stringify(json) || `HTTP ${resp.status}`;
     throw new Error(`Shopify token error: ${msg}`);
   }
-
-  if (!json.access_token) {
-    throw new Error(`Shopify token error: missing access_token in response`);
-  }
+  if (!json.access_token) throw new Error("Shopify token error: missing access_token in response");
 
   const expiresInSec = Number(json.expires_in || 0);
-  // Refresh a bit early (5 minutes)
+  // Refresh 5 minutes early
   const refreshEarlyMs = 5 * 60 * 1000;
   const ttlMs = Math.max(0, expiresInSec * 1000 - refreshEarlyMs);
 
   cachedAccessToken = json.access_token;
   cachedAccessTokenExpiresAtMs = Date.now() + ttlMs;
-
   return cachedAccessToken;
 }
 
 async function getShopifyAccessToken() {
-  // Prefer client credentials if configured
-  if (haveClientCreds()) {
-    if (cachedAccessToken && Date.now() < cachedAccessTokenExpiresAtMs) {
-      return cachedAccessToken;
-    }
-    return await fetchAccessTokenViaClientCredentials();
+  if (!haveClientCreds()) {
+    throw new Error("Missing Shopify credentials. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET.");
   }
-
-  // Fallback: legacy shpat_ token (if you still have it)
-  if (SHOP && LEGACY_TOKEN) return LEGACY_TOKEN;
-
-  throw new Error("Missing Shopify auth. Set SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET (preferred) or SHOPIFY_TOKEN (legacy).");
+  if (cachedAccessToken && Date.now() < cachedAccessTokenExpiresAtMs) return cachedAccessToken;
+  return await fetchAccessTokenViaClientCredentials();
 }
 
 // ----------------- Shopify API callers -----------------
 async function shopifyGraphql(query, variables) {
-  if (!SHOP) throw new Error("Missing SHOPIFY_SHOP");
   const token = await getShopifyAccessToken();
 
   const resp = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
@@ -137,32 +139,61 @@ async function shopifyGraphql(query, variables) {
     body: JSON.stringify({ query, variables }),
   });
 
-  const json = await resp.json();
+  const json = await resp.json().catch(() => ({}));
+
   if (!resp.ok) {
     const msg = json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`;
     throw new Error(`Shopify API error: ${msg}`);
   }
   if (json.errors) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+
   return json.data;
 }
 
 async function shopifyGetCustomerByIdNumeric(idNumeric) {
-  if (!SHOP) throw new Error("Missing SHOPIFY_SHOP");
   const token = await getShopifyAccessToken();
 
   const resp = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/customers/${idNumeric}.json`, {
     method: "GET",
     headers: {
       "X-Shopify-Access-Token": token,
-      "Accept": "application/json",
+      Accept: "application/json",
     },
   });
 
   const json = await resp.json().catch(() => ({}));
   if (resp.status === 404) return null;
+
   if (!resp.ok) {
     const msg = json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`;
     throw new Error(`Shopify REST error: ${msg}`);
+  }
+  return json.customer || null;
+}
+
+async function shopifyUpdateCustomer(idNumeric, updates) {
+  const token = await getShopifyAccessToken();
+
+  const resp = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/customers/${idNumeric}.json`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      customer: {
+        id: Number(idNumeric),
+        ...updates,
+      },
+    }),
+  });
+
+  const json = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    const msg = json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`;
+    throw new Error(`Shopify update error: ${msg}`);
   }
   return json.customer || null;
 }
@@ -175,7 +206,6 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
       : shopifyCustomer?.id;
 
   const entityId = sanitizeEntityId(String(idNumeric || ""));
-
   const firstName = shopifyCustomer?.firstName ?? shopifyCustomer?.first_name ?? "";
   const lastName = shopifyCustomer?.lastName ?? shopifyCustomer?.last_name ?? "";
   const email = shopifyCustomer?.email ?? "";
@@ -206,7 +236,7 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
     });
   }
 
-  // Only return an address if we can populate required fields reliably
+  // Only return address if we can fill required fields reliably
   let addr =
     shopifyCustomer?.defaultAddress ||
     shopifyCustomer?.default_address ||
@@ -265,20 +295,18 @@ async function handleV8Search(req, res, urlObj) {
   const limit = Math.max(1, Math.min(Number(urlObj.searchParams.get("limit") || 20), 100));
   const q = escapeForShopifySearch(qParam);
 
-  // Robust query (handles +phone / digits / email / name / fallback)
+  // Robust query for email/phone/name
   const raw = q;
   const isEmail = raw.includes("@");
   const digitsOnly = raw.replace(/[^\d]/g, "");
 
   const parts = [];
   if (isEmail) parts.push(`email:"${raw}"`);
-
   if (digitsOnly) {
     parts.push(`phone:"${digitsOnly}"`);
     parts.push(`phone:"+${digitsOnly}"`);
   }
   if (raw.startsWith("+") && digitsOnly) parts.push(`phone:"${raw}"`);
-
   parts.push(`name:"${raw}"`);
   parts.push(`"${raw}"`);
 
@@ -286,62 +314,6 @@ async function handleV8Search(req, res, urlObj) {
 
   const gql = `
     query SearchCustomers($query: String!, $first: Int!) {
-      customers(first: $first, query: $query) {
-        edges {
-          node {
-            id
-            firstName
-            lastName
-            email
-            phone
-            defaultAddress {
-              address1
-              address2
-              city
-              zip
-              countryCodeV2
-            }
-          }
-        }
-      }
-    }
-  `;
-
-  const data = await shopifyGraphql(gql, { query: shopifyQuery, first: limit });
-  const edges = data?.customers?.edges || [];
-  const customers = edges.map((e) => mapShopifyToV8SimpleCustomer(e.node));
-
-  return sendJson(res, 200, { customers });
-}
-
-async function handleV8SearchByProperty(req, res, urlObj) {
-  const storeId = requireStoreId(req);
-  if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
-
-  const limit = Math.max(1, Math.min(Number(urlObj.searchParams.get("limit") || 20), 100));
-
-  const firstName = escapeForShopifySearch(urlObj.searchParams.get("firstName") || "");
-  const lastName = escapeForShopifySearch(urlObj.searchParams.get("lastName") || "");
-  const email = escapeForShopifySearch(urlObj.searchParams.get("email") || "");
-  const phone = escapeForShopifySearch(urlObj.searchParams.get("phone") || "");
-
-  const parts = [];
-  if (email) parts.push(`email:"${email}"`);
-
-  const phoneDigits = phone.replace(/[^\d]/g, "");
-  if (phoneDigits) {
-    parts.push(`phone:"${phoneDigits}"`);
-    parts.push(`phone:"+${phoneDigits}"`);
-  }
-
-  if (firstName || lastName) parts.push(`name:"${[firstName, lastName].filter(Boolean).join(" ")}"`);
-
-  if (parts.length === 0) return sendJson(res, 200, { customers: [] });
-
-  const shopifyQuery = parts.join(" OR ");
-
-  const gql = `
-    query SearchCustomersByProperty($query: String!, $first: Int!) {
       customers(first: $first, query: $query) {
         edges {
           node {
@@ -384,15 +356,71 @@ async function handleV8GetCustomer(req, res, entityIdRaw) {
   return sendJson(res, 200, simple);
 }
 
-async function handleV8GetCustomersByCardId(req, res) {
+/**
+ * PUT /api/v8/customers/{entityId}
+ * MVP edit scope (A):
+ *  - firstName
+ *  - lastName
+ *  - email
+ *  - phone
+ *
+ * Input accepted:
+ *  - firstName / lastName / email fields
+ *  - OR communicationMechanisms entries with type EMAIL/PHONE
+ *
+ * Everything else is ignored.
+ */
+async function handleV8UpdateCustomer(req, res, entityIdRaw) {
   const storeId = requireStoreId(req);
   if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
 
-  // Shopify has no native "card id" for customers (unless you implement metafields).
-  return sendJson(res, 200, { customers: [] });
+  const entityId = sanitizeEntityId(entityIdRaw);
+  if (!entityId) return sendMessage(res, 400, "Invalid entityId");
+
+  const parsed = await readJsonBody(req);
+  if (parsed === "__INVALID_JSON__") return sendMessage(res, 400, "Invalid JSON body");
+  if (!parsed || typeof parsed !== "object") return sendMessage(res, 400, "Missing JSON body");
+
+  // Only allow these updates (Shopify REST uses snake_case)
+  const updates = {};
+
+  if (typeof parsed.firstName === "string" && parsed.firstName.trim() !== "") {
+    updates.first_name = parsed.firstName.trim();
+  }
+  if (typeof parsed.lastName === "string" && parsed.lastName.trim() !== "") {
+    updates.last_name = parsed.lastName.trim();
+  }
+  if (typeof parsed.email === "string" && parsed.email.trim() !== "") {
+    updates.email = parsed.email.trim();
+  }
+  if (typeof parsed.phone === "string" && parsed.phone.trim() !== "") {
+    updates.phone = parsed.phone.trim();
+  }
+
+  // Also accept from communicationMechanisms (v8 style)
+  if (Array.isArray(parsed.communicationMechanisms)) {
+    const emailComm = parsed.communicationMechanisms.find((c) => c?.type === "EMAIL" && c?.data);
+    const phoneComm = parsed.communicationMechanisms.find((c) => c?.type === "PHONE" && c?.data);
+
+    if (emailComm?.data && typeof emailComm.data === "string") updates.email = emailComm.data.trim();
+    if (phoneComm?.data && typeof phoneComm.data === "string") updates.phone = phoneComm.data.trim();
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return sendMessage(res, 400, "No supported fields provided. Supported: firstName, lastName, email, phone");
+  }
+
+  // Update in Shopify
+  await shopifyUpdateCustomer(entityId, updates);
+
+  // Re-read and return canonical v8 object
+  const updated = await shopifyGetCustomerByIdNumeric(entityId);
+  if (!updated) return sendMessage(res, 404, "customer not found after update");
+
+  return sendJson(res, 200, mapShopifyToV8SimpleCustomer(updated));
 }
 
-// Optional debug endpoint (leave for your own testing; remove before production)
+// Optional debug endpoint (keep for your own testing; remove for production)
 async function handleLegacyCustomersDemo(res) {
   const gql = `
     query {
@@ -424,18 +452,15 @@ const server = http.createServer(async (req, res) => {
       return await handleV8Search(req, res, urlObj);
     }
 
-    if (req.method === "GET" && urlObj.pathname === "/api/v8/customers/search-by-property") {
-      return await handleV8SearchByProperty(req, res, urlObj);
-    }
-
+    // Match /api/v8/customers/{entityId}
     const getCustomerMatch = urlObj.pathname.match(/^\/api\/v8\/customers\/([^/]+)$/);
-    if (req.method === "GET" && getCustomerMatch) {
-      return await handleV8GetCustomer(req, res, getCustomerMatch[1]);
-    }
-
-    const getByCardMatch = urlObj.pathname.match(/^\/api\/v8\/customers\/cards\/([^/]+)$/);
-    if (req.method === "GET" && getByCardMatch) {
-      return await handleV8GetCustomersByCardId(req, res);
+    if (getCustomerMatch) {
+      if (req.method === "GET") {
+        return await handleV8GetCustomer(req, res, getCustomerMatch[1]);
+      }
+      if (req.method === "PUT") {
+        return await handleV8UpdateCustomer(req, res, getCustomerMatch[1]);
+      }
     }
 
     return sendMessage(res, 404, "Not found");
