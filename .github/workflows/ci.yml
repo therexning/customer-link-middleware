@@ -18,19 +18,19 @@ jobs:
         with:
           node-version: "20"
 
-- name: Install dependencies (npm ci if lockfile exists, else npm install)
-  run: |
-    if [ -f package.json ]; then
-      if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-        echo "Lockfile found → running npm ci"
-        npm ci
-      else
-        echo "No lockfile → running npm install (will NOT be cached as cleanly as npm ci)"
-        npm install
-      fi
-    else
-      echo "No package.json → skipping npm install"
-    fi
+      - name: Install dependencies (npm ci if lockfile exists, else npm install)
+        run: |
+          if [ -f package.json ]; then
+            if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+              echo "Lockfile found -> running npm ci"
+              npm ci
+            else
+              echo "No lockfile -> running npm install (will NOT be cached as cleanly as npm ci)"
+              npm install
+            fi
+          else
+            echo "No package.json -> skipping npm install"
+          fi
 
       - name: Syntax check (server.js)
         run: node --check server.js
@@ -40,15 +40,15 @@ jobs:
           if [ -f scripts/smoke-test.js ]; then
             node --check scripts/smoke-test.js
           else
-            echo "No scripts/smoke-test.js → skipping"
+            echo "No scripts/smoke-test.js -> skipping"
           fi
 
       - name: Block accidental secrets (tracked files)
         run: |
           echo "Scanning tracked files for common secret filenames..."
           if git ls-files | grep -E '(^|/)(\.env|token\.txt|client_id\.txt|client_secret\.txt)$' ; then
-            echo "❌ Secret-like file is tracked by git. Remove it from git and add it to .gitignore."
+            echo "Secret-like file is tracked by git. Remove it from git and add it to .gitignore."
             exit 1
           else
-            echo "✅ No secret-like files tracked."
+            echo "No secret-like files tracked."
           fi
