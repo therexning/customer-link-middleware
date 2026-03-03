@@ -468,7 +468,7 @@ const server = http.createServer(async (req, res) => {
     return sendMessage(res, 500, err?.message || String(err));
   }
 });
-const x = ;
+
 const port = Number(process.env.PORT || 8080);
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
