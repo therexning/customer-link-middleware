@@ -18,14 +18,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies (only if package.json exists)
-        run: |
-          if [ -f package.json ]; then
-            echo "package.json found → running npm ci"
-            npm ci
-          else
-            echo "No package.json → skipping npm install"
-          fi
+- name: Install dependencies (npm ci if lockfile exists, else npm install)
+  run: |
+    if [ -f package.json ]; then
+      if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+        echo "Lockfile found → running npm ci"
+        npm ci
+      else
+        echo "No lockfile → running npm install (will NOT be cached as cleanly as npm ci)"
+        npm install
+      fi
+    else
+      echo "No package.json → skipping npm install"
+    fi
 
       - name: Syntax check (server.js)
         run: node --check server.js
