@@ -1,3 +1,4 @@
+![CI](../../actions/workflows/ci.yml/badge.svg)
 # Customer Link Middleware
 
 RPOS v8 → Cloud Run → Shopify (Dev Dashboard App, Client Credentials)
@@ -273,12 +274,16 @@ For production environments consider:
 Run:
 
 cmd.exe:
-
+```bash
 set BASE_URL=https://<your-cloud-run-url>
 set STORE_ID=101
 set TEST_Q=+61499999999
 node scripts\smoke-test.js
-</example>
+```
+---
+# Environments
+- demo
+- production (design only)
 
 ---
 # Summary
