@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  minimal-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (only if package.json exists)
+        run: |
+          if [ -f package.json ]; then
+            echo "package.json found → running npm ci"
+            npm ci
+          else
+            echo "No package.json → skipping npm install"
+          fi
+
+      - name: Syntax check (server.js)
+        run: node --check server.js
+
+      - name: Syntax check (smoke test script, if present)
+        run: |
+          if [ -f scripts/smoke-test.js ]; then
+            node --check scripts/smoke-test.js
+          else
+            echo "No scripts/smoke-test.js → skipping"
+          fi
+
+      - name: Block accidental secrets (tracked files)
+        run: |
+          echo "Scanning tracked files for common secret filenames..."
+          if git ls-files | grep -E '(^|/)(\.env|token\.txt|client_id\.txt|client_secret\.txt)$' ; then
+            echo "❌ Secret-like file is tracked by git. Remove it from git and add it to .gitignore."
+            exit 1
+          else
+            echo "✅ No secret-like files tracked."
+          fi
