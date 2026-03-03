@@ -1,7 +1,7 @@
 ![CI](../../actions/workflows/ci.yml/badge.svg)
 # Customer Link Middleware
 
-RPOS v8 → Cloud Run → Shopify (Dev Dashboard App, Client Credentials)
+RPOS v8 -> Cloud Run -> Shopify (Dev Dashboard App, Client Credentials)
 
 ---
 
@@ -9,8 +9,8 @@ RPOS v8 → Cloud Run → Shopify (Dev Dashboard App, Client Credentials)
 
 This project implements a middleware service that connects:
 
-```
-POS → RISB → Cloud Run (this service) → Shopify Admin API
+```text
+POS -> RISB -> Cloud Run (this service) -> Shopify Admin API
 ```
 
 It allows RPOS (Customer Service Web API v8) to read customer data from Shopify using:
@@ -49,7 +49,7 @@ Authentication with Shopify is handled via:
 
 ---
 
-# Step 1 — Enable Required Google Cloud Services (One-Time Setup)
+# Step 1 - Enable Required Google Cloud Services (One-Time Setup)
 
 ```bash
 gcloud services enable \
@@ -62,7 +62,7 @@ gcloud services enable \
 
 ---
 
-# Step 2 — Fix IAM Permissions (Avoid Common Deployment Errors)
+# Step 2 - Fix IAM Permissions (Avoid Common Deployment Errors)
 
 Cloud Run source deployments use:
 
@@ -82,7 +82,6 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
   --member="serviceAccount:<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com" \
   --role="roles/artifactregistry.writer"
 
-
 gcloud projects add-iam-policy-binding <PROJECT_ID> \
   --member="serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com" \
   --role="roles/artifactregistry.writer"
@@ -90,28 +89,25 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 ---
 
-# Step 3 — Shopify Dev Dashboard Setup
+# Step 3 - Shopify Dev Dashboard Setup
 
 1. Go to Shopify Dev Dashboard
 2. Create a new app
 3. Configure Admin API scopes (minimum required):
-
-   - `read_customers`
-
+- `read_customers`
 4. Install the app to your target store
 5. Copy:
-
-   - Client ID
-   - Client Secret
+- Client ID
+- Client Secret
 6. Confirm your store domain (example):
 
-   ```
-   roqqiodev.myshopify.com
-   ```
+```text
+roqqiodev.myshopify.com
+```
 
 ---
 
-# Step 4 — Store Shopify Credentials in Secret Manager
+# Step 4 - Store Shopify Credentials in Secret Manager
 
 ## Windows (No Trailing Newline)
 
@@ -120,7 +116,6 @@ echo|set /p=<CLIENT_ID> > client_id.txt
 gcloud secrets create shopify_client_id --data-file=client_id.txt
 del client_id.txt
 
-
 echo|set /p=<CLIENT_SECRET> > client_secret.txt
 gcloud secrets create shopify_client_secret --data-file=client_secret.txt
 del client_secret.txt
@@ -128,13 +123,12 @@ del client_secret.txt
 
 ---
 
-# Step 5 — Allow Cloud Run to Access Secrets
+# Step 5 - Allow Cloud Run to Access Secrets
 
 ```bash
 gcloud secrets add-iam-policy-binding shopify_client_id \
   --member="serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
-
 
 gcloud secrets add-iam-policy-binding shopify_client_secret \
   --member="serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com" \
@@ -143,7 +137,7 @@ gcloud secrets add-iam-policy-binding shopify_client_secret \
 
 ---
 
-# Step 6 — Deploy to Cloud Run
+# Step 6 - Deploy to Cloud Run
 
 From your project directory:
 
@@ -159,7 +153,7 @@ gcloud run deploy customer-link \
 
 Deployment will output a public HTTPS URL:
 
-```
+```text
 https://customer-link-xxxx.australia-southeast1.run.app
 ```
 
@@ -169,13 +163,13 @@ https://customer-link-xxxx.australia-southeast1.run.app
 
 The final endpoint should resolve to:
 
-```
+```text
 https://<cloud-run-url>/api/v8/...
 ```
 
 If RISB logs show:
 
-```
+```text
 /api/api/v8/...
 ```
 
@@ -196,16 +190,16 @@ Correct example:
 
 ## Search Customers
 
-```
+```text
 GET /api/v8/customers/search?q=...
 Header: storeId: 101
 ```
 
 Returns:
 
-```
+```json
 {
-  "customers": [ SimpleCustomer ]
+  "customers": [SimpleCustomer]
 }
 ```
 
@@ -213,7 +207,7 @@ Returns:
 
 ## Get Customer by ID
 
-```
+```text
 GET /api/v8/customers/{entityId}
 Header: storeId: 101
 ```
@@ -238,7 +232,6 @@ echo|set /p=<NEW_CLIENT_ID> > client_id.txt
 gcloud secrets versions add shopify_client_id --data-file=client_id.txt
 del client_id.txt
 
-
 echo|set /p=<NEW_CLIENT_SECRET> > client_secret.txt
 gcloud secrets versions add shopify_client_secret --data-file=client_secret.txt
 del client_secret.txt
@@ -258,7 +251,7 @@ gcloud run services update customer-link \
 
 Current deployment uses:
 
-```
+```text
 --allow-unauthenticated
 ```
 
@@ -270,22 +263,29 @@ For production environments consider:
 - Limiting by network
 
 ---
+
 # Verification (Smoke Test)
+
 Run:
 
 cmd.exe:
+
 ```bash
 set BASE_URL=https://<your-cloud-run-url>
 set STORE_ID=101
 set TEST_Q=+61499999999
 node scripts\smoke-test.js
 ```
+
 ---
+
 # Environments
+
 - demo
 - production (design only)
 
 ---
+
 # Summary
 
 This middleware provides a reusable integration pattern:
@@ -293,11 +293,6 @@ This middleware provides a reusable integration pattern:
 - RPOS v8 compatible
 - Shopify Dev Dashboard app compatible
 - Cloud Run scalable deployment
-- Dynamic token retrieval (no hardcoded shpat_ tokens)
+- Dynamic token retrieval (no hardcoded `shpat_` tokens)
 
 This document can be reused for future projects with minimal modification.
-
----
-
-End of README
-
