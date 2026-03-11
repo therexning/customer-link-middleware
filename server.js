@@ -1,10 +1,11 @@
 /**
- * RPOS Customer Service Web API v8 middleware (READ + LIMITED EDIT MVP)
+ * RPOS Customer Service Web API v8 middleware (READ + LIMITED EDIT + LIMITED CREATE MVP)
  *
  * Supports:
  *  - GET  /api/v8/customers/search?q=...
  *  - GET  /api/v8/customers/{entityId}
  *  - PUT  /api/v8/customers/{entityId}   (MVP: firstName/lastName/email/phone only)
+ *  - POST /api/v8/customers              (MVP: firstName/lastName/email/phone only)
  *
  * Auth to Shopify:
  *  - Dev Dashboard App via OAuth2 Client Credentials Grant
@@ -83,8 +84,6 @@ function haveClientCreds() {
 }
 
 async function fetchAccessTokenViaClientCredentials() {
-  // Shopify token endpoint for client credentials grant:
-  // POST https://{shop}/admin/oauth/access_token
   const tokenUrl = `https://${SHOP}/admin/oauth/access_token`;
 
   const body = new URLSearchParams();
@@ -109,7 +108,6 @@ async function fetchAccessTokenViaClientCredentials() {
   if (!json.access_token) throw new Error("Shopify token error: missing access_token in response");
 
   const expiresInSec = Number(json.expires_in || 0);
-  // Refresh 5 minutes early
   const refreshEarlyMs = 5 * 60 * 1000;
   const ttlMs = Math.max(0, expiresInSec * 1000 - refreshEarlyMs);
 
@@ -198,6 +196,31 @@ async function shopifyUpdateCustomer(idNumeric, updates) {
   return json.customer || null;
 }
 
+async function shopifyCreateCustomer(input) {
+  const token = await getShopifyAccessToken();
+
+  const resp = await fetch(`https://${SHOP}/admin/api/${API_VERSION}/customers.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      customer: input,
+    }),
+  });
+
+  const json = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    const msg = json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`;
+    throw new Error(`Shopify create error: ${msg}`);
+  }
+
+  return json.customer || null;
+}
+
 // ----------------- Mapping: Shopify -> RPOS v8 SimpleCustomer -----------------
 function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
   const idNumeric =
@@ -211,8 +234,13 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
   const email = shopifyCustomer?.email ?? "";
   const phone = shopifyCustomer?.phone ?? "";
 
-  const now = isoNow();
-  const far = isoFarFuture();
+  const createdAt =
+  shopifyCustomer?.createdAt ||
+  shopifyCustomer?.created_at ||
+  isoNow();
+
+const now = createdAt;
+const far = isoFarFuture();
 
   const communicationMechanisms = [];
   if (phone) {
@@ -236,7 +264,6 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
     });
   }
 
-  // Only return address if we can fill required fields reliably
   let addr =
     shopifyCustomer?.defaultAddress ||
     shopifyCustomer?.default_address ||
@@ -269,8 +296,6 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
     type: "PERSON",
     firstName,
     lastName,
-
-    // required fields (demo defaults)
     vatExempt: false,
     subscribeNewsletter: false,
     acceptTermsAndConditions: false,
@@ -278,7 +303,6 @@ function mapShopifyToV8SimpleCustomer(shopifyCustomer) {
     loyaltyState: "NO_PARTNER",
     validFrom: now,
     validTo: far,
-
     communicationMechanisms,
     addresses,
   };
@@ -295,7 +319,6 @@ async function handleV8Search(req, res, urlObj) {
   const limit = Math.max(1, Math.min(Number(urlObj.searchParams.get("limit") || 20), 100));
   const q = escapeForShopifySearch(qParam);
 
-  // Robust query for email/phone/name
   const raw = q;
   const isEmail = raw.includes("@");
   const digitsOnly = raw.replace(/[^\d]/g, "");
@@ -312,28 +335,29 @@ async function handleV8Search(req, res, urlObj) {
 
   const shopifyQuery = parts.join(" OR ");
 
-  const gql = `
-    query SearchCustomers($query: String!, $first: Int!) {
-      customers(first: $first, query: $query) {
-        edges {
-          node {
-            id
-            firstName
-            lastName
-            email
-            phone
-            defaultAddress {
-              address1
-              address2
-              city
-              zip
-              countryCodeV2
-            }
+const gql = `
+  query SearchCustomers($query: String!, $first: Int!) {
+    customers(first: $first, query: $query) {
+      edges {
+        node {
+          id
+          createdAt
+          firstName
+          lastName
+          email
+          phone
+          defaultAddress {
+            address1
+            address2
+            city
+            zip
+            countryCodeV2
           }
         }
       }
     }
-  `;
+  }
+`;
 
   const data = await shopifyGraphql(gql, { query: shopifyQuery, first: limit });
   const edges = data?.customers?.edges || [];
@@ -356,20 +380,6 @@ async function handleV8GetCustomer(req, res, entityIdRaw) {
   return sendJson(res, 200, simple);
 }
 
-/**
- * PUT /api/v8/customers/{entityId}
- * MVP edit scope (A):
- *  - firstName
- *  - lastName
- *  - email
- *  - phone
- *
- * Input accepted:
- *  - firstName / lastName / email fields
- *  - OR communicationMechanisms entries with type EMAIL/PHONE
- *
- * Everything else is ignored.
- */
 async function handleV8UpdateCustomer(req, res, entityIdRaw) {
   const storeId = requireStoreId(req);
   if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
@@ -381,7 +391,6 @@ async function handleV8UpdateCustomer(req, res, entityIdRaw) {
   if (parsed === "__INVALID_JSON__") return sendMessage(res, 400, "Invalid JSON body");
   if (!parsed || typeof parsed !== "object") return sendMessage(res, 400, "Missing JSON body");
 
-  // Only allow these updates (Shopify REST uses snake_case)
   const updates = {};
 
   if (typeof parsed.firstName === "string" && parsed.firstName.trim() !== "") {
@@ -397,7 +406,6 @@ async function handleV8UpdateCustomer(req, res, entityIdRaw) {
     updates.phone = parsed.phone.trim();
   }
 
-  // Also accept from communicationMechanisms (v8 style)
   if (Array.isArray(parsed.communicationMechanisms)) {
     const emailComm = parsed.communicationMechanisms.find((c) => c?.type === "EMAIL" && c?.data);
     const phoneComm = parsed.communicationMechanisms.find((c) => c?.type === "PHONE" && c?.data);
@@ -410,17 +418,59 @@ async function handleV8UpdateCustomer(req, res, entityIdRaw) {
     return sendMessage(res, 400, "No supported fields provided. Supported: firstName, lastName, email, phone");
   }
 
-  // Update in Shopify
   await shopifyUpdateCustomer(entityId, updates);
 
-  // Re-read and return canonical v8 object
   const updated = await shopifyGetCustomerByIdNumeric(entityId);
   if (!updated) return sendMessage(res, 404, "customer not found after update");
 
   return sendJson(res, 200, mapShopifyToV8SimpleCustomer(updated));
 }
 
-// Optional debug endpoint (keep for your own testing; remove for production)
+async function handleV8CreateCustomer(req, res) {
+  const storeId = requireStoreId(req);
+  if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
+
+  const parsed = await readJsonBody(req);
+  if (parsed === "__INVALID_JSON__") return sendMessage(res, 400, "Invalid JSON body");
+  if (!parsed || typeof parsed !== "object") return sendMessage(res, 400, "Missing JSON body");
+
+  const createInput = {};
+
+  if (typeof parsed.firstName === "string" && parsed.firstName.trim() !== "") {
+    createInput.first_name = parsed.firstName.trim();
+  }
+  if (typeof parsed.lastName === "string" && parsed.lastName.trim() !== "") {
+    createInput.last_name = parsed.lastName.trim();
+  }
+  if (typeof parsed.email === "string" && parsed.email.trim() !== "") {
+    createInput.email = parsed.email.trim();
+  }
+  if (typeof parsed.phone === "string" && parsed.phone.trim() !== "") {
+    createInput.phone = parsed.phone.trim();
+  }
+
+  if (Array.isArray(parsed.communicationMechanisms)) {
+    const emailComm = parsed.communicationMechanisms.find((c) => c?.type === "EMAIL" && c?.data);
+    const phoneComm = parsed.communicationMechanisms.find((c) => c?.type === "PHONE" && c?.data);
+
+    if (emailComm?.data && typeof emailComm.data === "string") createInput.email = emailComm.data.trim();
+    if (phoneComm?.data && typeof phoneComm.data === "string") createInput.phone = phoneComm.data.trim();
+  }
+
+  if (!createInput.first_name && !createInput.last_name && !createInput.email && !createInput.phone) {
+    return sendMessage(res, 400, "No supported fields provided. Supported: firstName, lastName, email, phone");
+  }
+
+const created = await shopifyCreateCustomer(createInput);
+if (!created) return sendMessage(res, 500, "Customer creation returned empty result");
+
+const createdId = created?.id;
+const canonical = createdId ? await shopifyGetCustomerByIdNumeric(createdId) : created;
+
+return sendJson(res, 201, mapShopifyToV8SimpleCustomer(canonical));
+}
+
+// Optional debug endpoint
 async function handleLegacyCustomersDemo(res) {
   const gql = `
     query {
@@ -452,14 +502,17 @@ const server = http.createServer(async (req, res) => {
       return await handleV8Search(req, res, urlObj);
     }
 
-    // Match /api/v8/customers/{entityId}
-    const getCustomerMatch = urlObj.pathname.match(/^\/api\/v8\/customers\/([^/]+)$/);
-    if (getCustomerMatch) {
+    if (req.method === "POST" && urlObj.pathname === "/api/v8/customers") {
+      return await handleV8CreateCustomer(req, res);
+    }
+
+    const customerMatch = urlObj.pathname.match(/^\/api\/v8\/customers\/([^/]+)$/);
+    if (customerMatch) {
       if (req.method === "GET") {
-        return await handleV8GetCustomer(req, res, getCustomerMatch[1]);
+        return await handleV8GetCustomer(req, res, customerMatch[1]);
       }
       if (req.method === "PUT") {
-        return await handleV8UpdateCustomer(req, res, getCustomerMatch[1]);
+        return await handleV8UpdateCustomer(req, res, customerMatch[1]);
       }
     }
 
