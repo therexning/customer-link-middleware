@@ -19,7 +19,7 @@
  * Notes:
  *  - Requests require header: storeId
  */
-
+const { createGiftcardHandlers } = require("./giftcard");
 const http = require("http");
 const { URL } = require("url");
 
@@ -486,6 +486,17 @@ async function handleLegacyCustomersDemo(res) {
 }
 
 // ----------------- server -----------------
+const giftcardHandlers = createGiftcardHandlers({
+  shopifyGraphql,
+  sendJson,
+  sendMessage,
+  readJsonBody,
+  requireStoreId,
+  config: {
+    giftcardExpiryYears: 3,
+    defaultGiftcardCurrency: "AUD",
+  },
+});
 const server = http.createServer(async (req, res) => {
   try {
     const urlObj = new URL(req.url, "http://localhost");
@@ -515,7 +526,21 @@ const server = http.createServer(async (req, res) => {
         return await handleV8UpdateCustomer(req, res, customerMatch[1]);
       }
     }
+    // Gift card: get by code
+    const giftcardMatch = urlObj.pathname.match(/^\/api\/v3\/vouchers\/([^/]+)$/);
+    if (req.method === "GET" && giftcardMatch) {
+      return await giftcardHandlers.handleGetGiftcard(req, res, decodeURIComponent(giftcardMatch[1]));
+    }
 
+    // Gift card: create
+    if (req.method === "POST" && urlObj.pathname === "/api/v3/vouchers") {
+      return await giftcardHandlers.handleCreateGiftcard(req, res);
+    }
+
+    // Gift card: redeem
+    if (req.method === "POST" && urlObj.pathname === "/api/v3/vouchers/redeem") {
+      return await giftcardHandlers.handleRedeemGiftcard(req, res);
+    }
     return sendMessage(res, 404, "Not found");
   } catch (err) {
     return sendMessage(res, 500, err?.message || String(err));
