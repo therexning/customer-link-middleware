@@ -6,11 +6,14 @@
  *  - GET  /api/v8/customers/{entityId}
  *  - PUT  /api/v8/customers/{entityId}   (MVP: firstName/lastName/email/phone only)
  *  - POST /api/v8/customers              (MVP: firstName/lastName/email/phone only)
+ *  - GET  /api/v2/customer-history/{customerId}
  *
  *  - GET  /api/v3/vouchers/{domain}/{voucherId}
  *  - GET  /api/v3/vouchers/{voucherId}
  *  - POST /api/v3/vouchers/{domain}
  *  - POST /api/v3/vouchers/{domain}/{voucherId}/redeem
+ *  - POST /api/v3/sales
+ *  - POST /{store}/api/v3/sales
  *
  * Not implemented (returns 501):
  *  - POST   /api/v3/vouchers/{domain}/{voucherId}            (CreateVoucherWithId)
@@ -36,9 +39,11 @@
 
 const http = require("http");
 const { URL } = require("url");
+const { XMLParser } = require("fast-xml-parser");
 
 const SHOP = process.env.SHOPIFY_SHOP;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
+const LOG_SHOPIFY_ORDER_PAYLOAD = process.env.LOG_SHOPIFY_ORDER_PAYLOAD === "true";
 
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -54,6 +59,11 @@ function sendJson(res, statusCode, obj, extraHeaders = {}) {
 
 function sendMessage(res, statusCode, message) {
   sendJson(res, statusCode, { message });
+}
+
+function sendEmpty(res, statusCode, extraHeaders = {}) {
+  res.writeHead(statusCode, extraHeaders);
+  res.end();
 }
 
 function isoNow() {
@@ -97,6 +107,12 @@ async function readJsonBody(req) {
   } catch {
     return "__INVALID_JSON__";
   }
+}
+
+async function readTextBody(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  return body;
 }
 
 function requireVoucherHeaders(req, res) {
@@ -252,6 +268,134 @@ async function shopifyCreateCustomer(input) {
   }
 
   return json.customer || null;
+}
+
+async function shopifyCreateOrder(order, options) {
+  if (LOG_SHOPIFY_ORDER_PAYLOAD) {
+    console.log("shopify orderCreate payload", JSON.stringify({ order, options }));
+  }
+
+  const data = await shopifyGraphql(
+    `
+      mutation CreateOrder($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
+        orderCreate(order: $order, options: $options) {
+          userErrors {
+            field
+            message
+          }
+          order {
+            id
+            name
+            createdAt
+          }
+        }
+      }
+    `,
+    { order, options }
+  );
+
+  return data?.orderCreate || null;
+}
+
+async function shopifyFindVariantByCode(code) {
+  const trimmed = String(code || "").trim();
+  if (!trimmed) return null;
+
+  const data = await shopifyGraphql(
+    `
+      query FindVariantByCode($query: String!) {
+        productVariants(first: 10, query: $query) {
+          nodes {
+            id
+            sku
+            barcode
+            title
+            product {
+              id
+              title
+            }
+          }
+        }
+      }
+    `,
+    { query: trimmed }
+  );
+
+  const nodes = data?.productVariants?.nodes || [];
+  if (!Array.isArray(nodes) || nodes.length === 0) return null;
+
+  const exact = nodes.find((node) => {
+    const sku = String(node?.sku || "").trim();
+    const barcode = String(node?.barcode || "").trim();
+    return sku === trimmed || barcode === trimmed;
+  });
+
+  return exact || null;
+}
+
+async function shopifyGetOrdersForCustomerHistory(customerIdNumeric, fromIso, toIso, limit = 100) {
+  const data = await shopifyGraphql(
+    `
+      query CustomerHistoryOrders($first: Int!, $query: String!) {
+        orders(first: $first, sortKey: CREATED_AT, reverse: true, query: $query) {
+          edges {
+            node {
+              id
+              name
+              createdAt
+              customer {
+                id
+              }
+              displayFinancialStatus
+              displayFulfillmentStatus
+              currentSubtotalPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+              customAttributes {
+                key
+                value
+              }
+              lineItems(first: 100) {
+                nodes {
+                  quantity
+                  name
+                  sku
+                  customAttributes {
+                    key
+                    value
+                  }
+                  originalUnitPriceSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  originalTotalSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  variant {
+                    legacyResourceId
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `,
+    {
+      first: limit,
+      query: `customer_id:${customerIdNumeric} AND created_at:>='${fromIso}' AND created_at:<='${toIso}'`,
+    }
+  );
+
+  return data?.orders?.edges || [];
 }
 
 // ----------------- Mapping: Shopify -> RPOS v8 SimpleCustomer -----------------
@@ -824,6 +968,319 @@ async function handleV3GetCustomerVouchersAllDomains(req, res, customerIdRaw) {
   });
 }
 
+// ----------------- sales v3 helpers -----------------
+const DEFAULT_ORDER_CURRENCY = "AUD";
+const saleXmlParser = new XMLParser({
+  ignoreAttributes: false,
+  trimValues: true,
+  parseTagValue: false,
+});
+
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null || value === "") return [];
+  return [value];
+}
+
+function parseNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseRequiredPositiveInt(value, fallback = 1) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  if (!Number.isInteger(n)) {
+    throw new Error(`Unsupported non-integer quantity for MVP: ${value}`);
+  }
+  return n;
+}
+
+function moneyInput(amount, currencyCode) {
+  return {
+    shopMoney: {
+      amount: Number(amount.toFixed(2)),
+      currencyCode,
+    },
+  };
+}
+
+function extractCommunicationValue(mechanisms, type) {
+  const entry = asArray(mechanisms).find((item) => String(item?.type || "").toUpperCase() === type && item?.data);
+  return entry?.data ? String(entry.data).trim() : "";
+}
+
+function extractTextAttributeValue(textAttributes, key) {
+  const attr = asArray(textAttributes?.TextAttribute).find((item) => String(item?.key || "").trim() === key);
+  return attr?.value ? String(attr.value).trim() : "";
+}
+
+function extractCustomAttributeValue(customAttributes, key) {
+  const attr = asArray(customAttributes).find((item) => String(item?.key || "").trim() === key);
+  return attr?.value ? String(attr.value).trim() : "";
+}
+
+function buildSaleLineTitle(skuLine) {
+  const itemShort = String(skuLine?.item?.Item?.descriptionShort || "").trim();
+  const skuShort = String(skuLine?.sku?.Sku?.descriptionShort || "").trim();
+  const supplierSkuNumber = String(skuLine?.sku?.Sku?.supplierSkuNumber || "").trim();
+
+  const parts = [itemShort, skuShort].filter(Boolean);
+  if (parts.length > 0) return parts.join(" - ");
+  if (supplierSkuNumber) return supplierSkuNumber;
+  return `POS SKU ${String(skuLine?.skuEntityId || "UNKNOWN").trim()}`;
+}
+
+function getSaleLineCodes(skuLine) {
+  return [
+    extractTextAttributeValue(skuLine?.textAttributes, "scan-code"),
+    String(skuLine?.sku?.Sku?.supplierSkuNumber || "").trim(),
+    String(skuLine?.sku?.Sku?.entityId || "").trim(),
+    String(skuLine?.skuEntityId || "").trim(),
+  ].filter(Boolean);
+}
+
+async function mapSaleLineToShopifyLineItem(skuLine, currency, variantCache) {
+  const quantity = parseRequiredPositiveInt(skuLine?.quantity, 1);
+  const unitPrice = parseNumber(skuLine?.price);
+  const codes = getSaleLineCodes(skuLine);
+  const originalSkuEntityId = String(skuLine?.skuEntityId || "").trim();
+  let matchedVariant = null;
+
+  for (const code of codes) {
+    if (!variantCache.has(code)) {
+      variantCache.set(code, await shopifyFindVariantByCode(code));
+    }
+
+    const candidate = variantCache.get(code);
+    if (candidate?.id) {
+      matchedVariant = candidate;
+      break;
+    }
+  }
+
+  const lineItem = {
+    title: buildSaleLineTitle(skuLine),
+    quantity,
+    priceSet: moneyInput(unitPrice, currency),
+    taxable: false,
+    properties: [
+      { name: "pos_sku_entity_id", value: originalSkuEntityId },
+    ].filter((entry) => entry.value),
+  };
+
+  if (matchedVariant?.id) {
+    lineItem.variantId = matchedVariant.id;
+  }
+
+  return lineItem;
+}
+
+async function buildShopifyOrderInputFromSale(parsedSale) {
+  const currency =
+    String(
+      parsedSale?.paymentLines?.PaymentLine?.systemAmountUnit ||
+        parsedSale?.saleLines?.SkuLine?.priceUnit ||
+        DEFAULT_ORDER_CURRENCY
+    ).trim() || DEFAULT_ORDER_CURRENCY;
+
+  const saleLines = asArray(parsedSale?.saleLines?.SkuLine);
+  if (saleLines.length === 0) {
+    throw new Error("Sale contains no SkuLine entries");
+  }
+
+  const variantCache = new Map();
+  const lineItems = [];
+  for (const line of saleLines) {
+    lineItems.push(await mapSaleLineToShopifyLineItem(line, currency, variantCache));
+  }
+
+  const paymentLines = asArray(parsedSale?.paymentLines?.PaymentLine);
+  const paidAmount = paymentLines.reduce((sum, line) => sum + parseNumber(line?.systemAmount), 0);
+  const fallbackTotal = saleLines.reduce((sum, line) => sum + parseNumber(line?.lineValueGross), 0);
+  const transactionAmount = paidAmount > 0 ? paidAmount : fallbackTotal;
+
+  const customerNode = parsedSale?.customer?.SimpleCustomer || {};
+  const email = extractCommunicationValue(customerNode?.communicationMechanisms?.CommunicationMechanism, "EMAIL");
+  const phone =
+    extractCommunicationValue(customerNode?.communicationMechanisms?.CommunicationMechanism, "MOBILE") ||
+    extractCommunicationValue(customerNode?.communicationMechanisms?.CommunicationMechanism, "PHONE");
+
+  const customerEntityId = String(
+    parsedSale?.customerEntityId ||
+      parsedSale?.externalCustomerNumber ||
+      customerNode?.entityId ||
+      ""
+  ).trim();
+
+  const order = {
+    currency,
+    taxesIncluded: true,
+    financialStatus: "PAID",
+    fulfillmentStatus: "FULFILLED",
+    lineItems,
+    transactions: [
+      {
+        kind: "SALE",
+        status: "SUCCESS",
+        amountSet: moneyInput(transactionAmount, currency),
+      },
+    ],
+    note: `POS receipt ${String(parsedSale?.receiptNumber || "").trim()} from branch ${String(parsedSale?.branchEntityId || "").trim()}`,
+    customAttributes: [
+      { key: "pos_receipt_number", value: String(parsedSale?.receiptNumber || "").trim() },
+      { key: "pos_receipt_state", value: String(parsedSale?.receiptState || "").trim() },
+      { key: "pos_timestamp", value: String(parsedSale?.timestamp || "").trim() },
+      { key: "pos_branch_entity_id", value: String(parsedSale?.branchEntityId || "").trim() },
+      { key: "pos_till_entity_id", value: String(parsedSale?.tillEntityId || "").trim() },
+      { key: "pos_customer_entity_id", value: customerEntityId },
+    ].filter((entry) => entry.value),
+  };
+
+  if (email) order.email = email;
+  if (phone) order.phone = phone;
+
+  if (customerEntityId && /^\d+$/.test(customerEntityId)) {
+    order.customerId = `gid://shopify/Customer/${customerEntityId}`;
+  }
+
+  return order;
+}
+
+async function handleV3Sale(req, res) {
+  const rawXml = await readTextBody(req);
+  if (!rawXml || !rawXml.trim()) return sendMessage(res, 400, "Missing XML body");
+
+  let parsed;
+  try {
+    parsed = saleXmlParser.parse(rawXml);
+  } catch {
+    return sendMessage(res, 400, "Invalid XML body");
+  }
+
+  const sale = parsed?.Sale;
+  if (!sale || typeof sale !== "object") {
+    return sendMessage(res, 400, "Invalid Sale payload");
+  }
+
+  const receiptState = String(sale?.receiptState || "").trim().toUpperCase();
+  if (receiptState !== "FINISHED") {
+    return sendEmpty(res, 200);
+  }
+
+  const externalCustomerNumber = String(sale?.externalCustomerNumber || "").trim();
+  if (!externalCustomerNumber) {
+    return sendEmpty(res, 200);
+  }
+
+  const orderInput = await buildShopifyOrderInputFromSale(sale);
+  const payload = await shopifyCreateOrder(orderInput, { inventoryBehaviour: "BYPASS" });
+  const userErrors = payload?.userErrors || [];
+
+  if (Array.isArray(userErrors) && userErrors.length > 0) {
+    const first = userErrors[0];
+    return sendMessage(res, 409, first?.message || "orderCreate error");
+  }
+
+  if (!payload?.order?.id) {
+    return sendMessage(res, 500, "Shopify did not return an order id");
+  }
+
+  return sendEmpty(res, 200);
+}
+
+// ----------------- customer history v2 helpers -----------------
+function toStartOfDayIso(dateOnly) {
+  return `${dateOnly}T00:00:00Z`;
+}
+
+function toEndOfDayIso(dateOnly) {
+  return `${dateOnly}T23:59:59Z`;
+}
+
+function isDateOnly(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
+}
+
+function formatHistoryTimestamp(input) {
+  const d = new Date(input);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function buildHistoryReceiptCode(order) {
+  const branch = extractCustomAttributeValue(order?.customAttributes, "pos_branch_entity_id");
+  const till = extractCustomAttributeValue(order?.customAttributes, "pos_till_entity_id");
+  const receipt = extractCustomAttributeValue(order?.customAttributes, "pos_receipt_number");
+  if (branch && till && receipt) return `${branch}-${till}-${receipt}`;
+  return String(order?.name || "").trim();
+}
+
+function mapOrderLineItemToCustomerHistoryEntry(order, lineItem, customerId, storeId) {
+  const branchEntityId = extractCustomAttributeValue(order?.customAttributes, "pos_branch_entity_id") || `1-${storeId}`;
+  const transactionTimestamp = formatHistoryTimestamp(order?.createdAt);
+  const priceAmount = parseNumber(lineItem?.originalUnitPriceSet?.shopMoney?.amount);
+  const lineValueGross = parseNumber(lineItem?.originalTotalSet?.shopMoney?.amount);
+  const currency = String(
+    lineItem?.originalUnitPriceSet?.shopMoney?.currencyCode ||
+      lineItem?.originalTotalSet?.shopMoney?.currencyCode ||
+      DEFAULT_ORDER_CURRENCY
+  ).trim() || DEFAULT_ORDER_CURRENCY;
+
+  const posSkuEntityId = extractCustomAttributeValue(lineItem?.customAttributes, "pos_sku_entity_id");
+  const skuEntityId = String(
+    posSkuEntityId ||
+      lineItem?.sku ||
+      lineItem?.variant?.legacyResourceId ||
+      ""
+  ).trim();
+
+  return {
+    branchEntityId,
+    skuEntityId,
+    text: String(posSkuEntityId || lineItem?.sku || lineItem?.name || "").trim(),
+    customerEntityId: String(customerId),
+    transactionTimestamp,
+    historyDocumentType: "POS",
+    receiptCode: buildHistoryReceiptCode(order),
+    lineType: "ARTICLE",
+    quantity: parseRequiredPositiveInt(lineItem?.quantity, 1),
+    quantityUnit: currency,
+    originalPrice: null,
+    originalPriceUnit: currency,
+    price: priceAmount,
+    priceUnit: currency,
+    lineValueNet: null,
+    lineValueNetUnit: currency,
+    lineValueGross,
+    lineValueGrossUnit: currency,
+  };
+}
+
+async function handleV2CustomerHistory(req, res, customerIdRaw, urlObj) {
+  const storeId = requireStoreId(req);
+  if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
+
+  const customerId = String(customerIdRaw || "").trim();
+  if (!/^\d+$/.test(customerId)) return sendMessage(res, 400, "Invalid customerId");
+
+  const from = String(urlObj.searchParams.get("from") || "").trim();
+  const to = String(urlObj.searchParams.get("to") || "").trim();
+
+  if (!isDateOnly(from)) return sendMessage(res, 400, "Invalid or missing query parameter: from");
+  if (!isDateOnly(to)) return sendMessage(res, 400, "Invalid or missing query parameter: to");
+
+  const orderEdges = await shopifyGetOrdersForCustomerHistory(customerId, toStartOfDayIso(from), toEndOfDayIso(to));
+  const entries = orderEdges.flatMap((edge) => {
+    const order = edge?.node;
+    const lineItems = asArray(order?.lineItems?.nodes);
+    return lineItems.map((lineItem) => mapOrderLineItemToCustomerHistoryEntry(order, lineItem, customerId, storeId));
+  });
+
+  return sendJson(res, 200, { entries });
+}
+
 // Optional debug endpoint
 async function handleLegacyCustomersDemo(res) {
   const gql = `
@@ -861,6 +1318,11 @@ const server = http.createServer(async (req, res) => {
       return await handleV8CreateCustomer(req, res);
     }
 
+    const customerHistoryMatch = urlObj.pathname.match(/^(?:\/[^/]+)?\/api\/v2\/customer-history\/([^/]+)$/);
+    if (customerHistoryMatch && req.method === "GET") {
+      return await handleV2CustomerHistory(req, res, decodeURIComponent(customerHistoryMatch[1]), urlObj);
+    }
+
     const customerMatch = urlObj.pathname.match(/^\/api\/v8\/customers\/([^/]+)$/);
     if (customerMatch) {
       if (req.method === "GET") {
@@ -872,6 +1334,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----------------- voucher v3 -----------------
+
+    const saleMatch = urlObj.pathname.match(/^(?:\/[^/]+)?\/api\/v3\/sales$/);
+    if (saleMatch && req.method === "POST") {
+      return await handleV3Sale(req, res);
+    }
 
     // GET /api/v3/vouchers/{domain}/{voucherId}
     const voucherByDomainMatch = urlObj.pathname.match(/^\/api\/v3\/vouchers\/([^/]+)\/([^/]+)$/);

@@ -17,6 +17,8 @@ It allows RPOS (Customer Service Web API v8) to read customer data from Shopify 
 
 - `GET /api/v8/customers/search`
 - `GET /api/v8/customers/{entityId}`
+- `GET /api/v2/customer-history/{customerId}`
+- `POST /api/v3/sales`
 
 Authentication with Shopify is handled via:
 
@@ -37,6 +39,13 @@ Authentication with Shopify is handled via:
 5. Shopify returns customer data
 6. Middleware maps to RPOS v8 schema
 7. Response returned to POS
+
+For sales and history:
+
+1. POS posts finished receipts to `/api/v3/sales`
+2. Middleware creates Shopify orders using the existing app auth
+3. POS reads customer history from `/api/v2/customer-history/{customerId}`
+4. Middleware flattens Shopify order lines back into the POS history schema
 
 ---
 
@@ -94,7 +103,10 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 1. Go to Shopify Dev Dashboard
 2. Create a new app
 3. Configure Admin API scopes (minimum required):
+- `read_orders`
 - `read_customers`
+- `write_customers`
+- `write_orders`
 4. Install the app to your target store
 5. Copy:
 - Client ID
@@ -214,12 +226,72 @@ Header: storeId: 101
 
 ---
 
+## Get Customer History
+
+```text
+GET /api/v2/customer-history/{customerId}?from=YYYY-MM-DD&to=YYYY-MM-DD
+GET /{store}/api/v2/customer-history/{customerId}?from=YYYY-MM-DD&to=YYYY-MM-DD
+Header: storeId: 101
+```
+
+MVP behaviour:
+
+- reads Shopify orders for the numeric customer id in the requested date range
+- flattens order line items into `entries[]`
+- includes all matching Shopify orders, not only POS-originated orders
+- uses POS receipt metadata from order custom attributes when available
+- falls back to the order name as `receiptCode` and `1-{storeId}` as `branchEntityId`
+- prefers the original POS `skuEntityId` when stored on the order line
+- otherwise uses Shopify line item `sku` before falling back to Shopify variant ids
+
+Notes:
+
+- query currently reads up to 100 matching orders, with up to 100 line items per order
+- older Shopify orders may require `read_all_orders` depending on the app install and store rules
+
+---
+
+## Post Finished Sale
+
+```text
+POST /api/v3/sales
+POST /{store}/api/v3/sales
+Content-Type: application/xml
+```
+
+MVP behaviour:
+
+- accepts the 4POS v3 `Sale` XML payload
+- ignores receipts that are not `FINISHED`
+- only forwards receipts that include `externalCustomerNumber`
+- maps `SkuLine` entries into Shopify order line items and attempts Shopify variant matching
+- creates the Shopify order as paid and fulfilled
+- treats POS sale prices as tax-inclusive
+- maps the sale payment total into a single successful Shopify transaction
+- stores the original POS `skuEntityId` on each Shopify order line for history round-tripping
+- returns HTTP `200` with an empty body on success
+
+Current assumptions:
+
+- sale quantities must be whole numbers
+- customer linkage uses the incoming numeric `externalCustomerNumber`
+- variant matching tries `scan-code`, `supplierSkuNumber`, `Sku.entityId`, then `skuEntityId`
+- inventory behaviour is `BYPASS`
+
+Debugging:
+
+- set `LOG_SHOPIFY_ORDER_PAYLOAD=true` to log the exact `orderCreate` body sent to Shopify
+
+---
+
 # Verification Checklist
 
 1. `GET /` returns status ok
 2. `GET /api/v8/customers/search?q=Rex` returns customer list
 3. `GET /api/v8/customers/{entityId}` returns single customer
 4. POS search via RISB works
+5. POS finished sale posts to `/api/v3/sales` and creates a Shopify order
+6. `GET /api/v2/customer-history/{customerId}` returns flattened order history entries
 
 ---
 
