@@ -30,6 +30,7 @@
  *  - SHOPIFY_CLIENT_ID
  *  - SHOPIFY_CLIENT_SECRET
  *  - SHOPIFY_API_VERSION=2026-01
+ *  - CUSTOMER_WRITE_MODE=enabled|block_update|block_create|block_all
  *
  * Notes:
  *  - Customer API requires header: storeId
@@ -44,6 +45,7 @@ const { XMLParser } = require("fast-xml-parser");
 const SHOP = process.env.SHOPIFY_SHOP;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 const LOG_SHOPIFY_ORDER_PAYLOAD = process.env.LOG_SHOPIFY_ORDER_PAYLOAD === "true";
+const CUSTOMER_WRITE_MODE = String(process.env.CUSTOMER_WRITE_MODE || "enabled").trim().toLowerCase();
 
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
@@ -122,6 +124,22 @@ function requireVoucherHeaders(req, res) {
     return false;
   }
   return true;
+}
+
+function canCreateCustomer() {
+  return CUSTOMER_WRITE_MODE !== "block_create" && CUSTOMER_WRITE_MODE !== "block_all";
+}
+
+function canUpdateCustomer() {
+  return CUSTOMER_WRITE_MODE !== "block_update" && CUSTOMER_WRITE_MODE !== "block_all";
+}
+
+function logCustomerWriteBlock(action, details = {}) {
+  console.log("customer write blocked", JSON.stringify({
+    action,
+    mode: CUSTOMER_WRITE_MODE,
+    ...details,
+  }));
 }
 
 // ----------------- Shopify access token (client credentials grant) -----------------
@@ -268,6 +286,31 @@ async function shopifyCreateCustomer(input) {
   }
 
   return json.customer || null;
+}
+
+async function shopifyFindCustomerByExactEmail(email) {
+  const trimmed = String(email || "").trim();
+  if (!trimmed) return null;
+
+  const data = await shopifyGraphql(
+    `
+      query FindCustomerByExactEmail($query: String!) {
+        customers(first: 1, query: $query) {
+          edges {
+            node {
+              id
+              email
+            }
+          }
+        }
+      }
+    `,
+    { query: `email:"${escapeForShopifySearch(trimmed)}"` }
+  );
+
+  const node = data?.customers?.edges?.[0]?.node || null;
+  if (!node?.email) return null;
+  return String(node.email).trim().toLowerCase() === trimmed.toLowerCase() ? node : null;
 }
 
 async function shopifyCreateOrder(order, options) {
@@ -560,6 +603,11 @@ async function handleV8UpdateCustomer(req, res, entityIdRaw) {
   const storeId = requireStoreId(req);
   if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
 
+  if (!canUpdateCustomer()) {
+    logCustomerWriteBlock("update", { storeId, entityId: String(entityIdRaw || "").trim() });
+    return sendMessage(res, 403, "Customer updates are currently disabled by middleware configuration");
+  }
+
   const entityId = sanitizeEntityId(entityIdRaw);
   if (!entityId) return sendMessage(res, 400, "Invalid entityId");
 
@@ -606,6 +654,11 @@ async function handleV8CreateCustomer(req, res) {
   const storeId = requireStoreId(req);
   if (!storeId) return sendMessage(res, 400, "Missing required header: storeId");
 
+  if (!canCreateCustomer()) {
+    logCustomerWriteBlock("create", { storeId });
+    return sendMessage(res, 403, "Customer creation is currently disabled by middleware configuration");
+  }
+
   const parsed = await readJsonBody(req);
   if (parsed === "__INVALID_JSON__") return sendMessage(res, 400, "Invalid JSON body");
   if (!parsed || typeof parsed !== "object") return sendMessage(res, 400, "Missing JSON body");
@@ -635,6 +688,13 @@ async function handleV8CreateCustomer(req, res) {
 
   if (!createInput.first_name && !createInput.last_name && !createInput.email && !createInput.phone) {
     return sendMessage(res, 400, "No supported fields provided. Supported: firstName, lastName, email, phone");
+  }
+
+  if (createInput.email) {
+    const existingCustomer = await shopifyFindCustomerByExactEmail(createInput.email);
+    if (existingCustomer) {
+      return sendMessage(res, 409, `customer with email ${createInput.email} already exists`);
+    }
   }
 
   const created = await shopifyCreateCustomer(createInput);

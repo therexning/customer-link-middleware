@@ -159,7 +159,7 @@ gcloud run deploy customer-link \
   --platform managed \
   --source . \
   --allow-unauthenticated \
-  --set-env-vars SHOPIFY_SHOP=<YOUR_SHOP>.myshopify.com,SHOPIFY_API_VERSION=2026-01 \
+  --set-env-vars SHOPIFY_SHOP=<YOUR_SHOP>.myshopify.com,SHOPIFY_API_VERSION=2026-01,CUSTOMER_WRITE_MODE=enabled \
   --set-secrets SHOPIFY_CLIENT_ID=shopify_client_id:latest,SHOPIFY_CLIENT_SECRET=shopify_client_secret:latest
 ```
 
@@ -222,6 +222,37 @@ Returns:
 ```text
 GET /api/v8/customers/{entityId}
 Header: storeId: 101
+```
+
+---
+
+## Customer Write Configuration
+
+Use `CUSTOMER_WRITE_MODE` to control customer create/update behaviour without code changes.
+
+Supported values:
+
+- `enabled`: customer create and update allowed
+- `block_update`: customer update blocked, create allowed
+- `block_create`: customer create blocked, update allowed
+- `block_all`: both customer create and update blocked
+
+When blocked:
+
+- middleware returns HTTP `403`
+- middleware logs `customer write blocked` with the active mode
+
+Customer create duplicate check:
+
+- when `POST /api/v8/customers` includes an email address, middleware performs an exact Shopify email lookup first
+- if that email already exists in Shopify, middleware returns HTTP `409`
+
+Example:
+
+```bash
+gcloud run services update customer-link \
+  --region australia-southeast1 \
+  --update-env-vars CUSTOMER_WRITE_MODE=block_update
 ```
 
 ---
