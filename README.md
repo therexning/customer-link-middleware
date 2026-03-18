@@ -239,7 +239,7 @@ Supported values:
 
 When blocked:
 
-- middleware returns HTTP `403`
+- middleware returns HTTP `409`
 - middleware logs `customer write blocked` with the active mode
 
 Customer create duplicate check:

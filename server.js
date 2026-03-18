@@ -605,7 +605,7 @@ async function handleV8UpdateCustomer(req, res, entityIdRaw) {
 
   if (!canUpdateCustomer()) {
     logCustomerWriteBlock("update", { storeId, entityId: String(entityIdRaw || "").trim() });
-    return sendMessage(res, 403, "Customer updates are currently disabled by middleware configuration");
+    return sendMessage(res, 409, "Customer updates are currently disabled by middleware configuration");
   }
 
   const entityId = sanitizeEntityId(entityIdRaw);
@@ -656,7 +656,7 @@ async function handleV8CreateCustomer(req, res) {
 
   if (!canCreateCustomer()) {
     logCustomerWriteBlock("create", { storeId });
-    return sendMessage(res, 403, "Customer creation is currently disabled by middleware configuration");
+    return sendMessage(res, 409, "Customer creation is currently disabled by middleware configuration");
   }
 
   const parsed = await readJsonBody(req);
